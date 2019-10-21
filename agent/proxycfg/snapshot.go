@@ -40,6 +40,28 @@ type configSnapshotMeshGateway struct {
 	ServiceGroups      map[structs.ServiceID]structs.CheckServiceNodes
 	ServiceResolvers   map[structs.ServiceID]*structs.ServiceResolverConfigEntry
 	GatewayGroups      map[string]structs.CheckServiceNodes
+	FedStateGateways   map[string]structs.CheckServiceNodes
+	ConsulServers      structs.CheckServiceNodes
+}
+
+func (c *configSnapshotMeshGateway) Datacenters() []string {
+	sz1, sz2 := len(c.GatewayGroups), len(c.FedStateGateways)
+
+	sz := sz1
+	if sz2 > sz1 {
+		sz = sz2
+	}
+
+	dcs := make([]string, 0, sz)
+	for dc, _ := range c.GatewayGroups {
+		dcs = append(dcs, dc)
+	}
+	for dc, _ := range c.FedStateGateways {
+		if _, ok := c.GatewayGroups[dc]; !ok {
+			dcs = append(dcs, dc)
+		}
+	}
+	return dcs
 }
 
 func (c *configSnapshotMeshGateway) IsEmpty() bool {
@@ -51,7 +73,9 @@ func (c *configSnapshotMeshGateway) IsEmpty() bool {
 		len(c.WatchedDatacenters) == 0 &&
 		len(c.ServiceGroups) == 0 &&
 		len(c.ServiceResolvers) == 0 &&
-		len(c.GatewayGroups) == 0
+		len(c.GatewayGroups) == 0 &&
+		len(c.FedStateGateways) == 0 &&
+		len(c.ConsulServers) == 0
 }
 
 // ConfigSnapshot captures all the resulting config needed for a proxy instance.
@@ -63,11 +87,13 @@ type ConfigSnapshot struct {
 	ProxyID         structs.ServiceID
 	Address         string
 	Port            int
+	ServiceMeta     map[string]string
 	TaggedAddresses map[string]structs.ServiceAddress
 	Proxy           structs.ConnectProxyConfig
 	Datacenter      string
 
-	Roots *structs.IndexedCARoots
+	ServerSNIFn ServerSNIFunc
+	Roots       *structs.IndexedCARoots
 
 	// connect-proxy specific
 	ConnectProxy configSnapshotConnectProxy
@@ -84,6 +110,11 @@ func (s *ConfigSnapshot) Valid() bool {
 	case structs.ServiceKindConnectProxy:
 		return s.Roots != nil && s.ConnectProxy.Leaf != nil
 	case structs.ServiceKindMeshGateway:
+		if s.ServiceMeta[structs.MetaWANFederationKey] == "1" {
+			if len(s.MeshGateway.ConsulServers) == 0 {
+				return false
+			}
+		}
 		return s.Roots != nil && (s.MeshGateway.WatchedServicesSet || len(s.MeshGateway.ServiceGroups) > 0)
 	default:
 		return false

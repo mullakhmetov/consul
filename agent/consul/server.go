@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,6 +36,7 @@ import (
 	connlimit "github.com/hashicorp/go-connlimit"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-memdb"
+	"github.com/hashicorp/memberlist"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb"
 	"github.com/hashicorp/serf/serf"
@@ -90,17 +92,20 @@ const (
 )
 
 const (
-	legacyACLReplicationRoutineName    = "legacy ACL replication"
-	aclPolicyReplicationRoutineName    = "ACL policy replication"
-	aclRoleReplicationRoutineName      = "ACL role replication"
-	aclTokenReplicationRoutineName     = "ACL token replication"
-	aclTokenReapingRoutineName         = "acl token reaping"
-	aclUpgradeRoutineName              = "legacy ACL token upgrade"
-	caRootPruningRoutineName           = "CA root pruning"
-	configReplicationRoutineName       = "config entry replication"
-	intentionReplicationRoutineName    = "intention replication"
-	secondaryCARootWatchRoutineName    = "secondary CA roots watch"
-	secondaryCertRenewWatchRoutineName = "secondary cert renew watch"
+	legacyACLReplicationRoutineName       = "legacy ACL replication"
+	aclPolicyReplicationRoutineName       = "ACL policy replication"
+	aclRoleReplicationRoutineName         = "ACL role replication"
+	aclTokenReplicationRoutineName        = "ACL token replication"
+	aclTokenReapingRoutineName            = "acl token reaping"
+	aclUpgradeRoutineName                 = "legacy ACL token upgrade"
+	caRootPruningRoutineName              = "CA root pruning"
+	configReplicationRoutineName          = "config entry replication"
+	federationStateReplicationRoutineName = "federation state replication"
+	federationStateAntiEntropyRoutineName = "federation state anti-entropy"
+	federationStatePruningRoutineName     = "federation state pruning"
+	intentionReplicationRoutineName       = "intention replication"
+	secondaryCARootWatchRoutineName       = "secondary CA roots watch"
+	secondaryCertRenewWatchRoutineName    = "secondary cert renew watch"
 )
 
 var (
@@ -146,6 +151,10 @@ type Server struct {
 	// configReplicator is used to manage the leaders replication routines for
 	// centralized config
 	configReplicator *Replicator
+
+	// federationStateReplicator is used to manage the leaders replication routines for
+	// federation states
+	federationStateReplicator *Replicator
 
 	// tokens holds ACL tokens initially from the configuration, but can
 	// be updated at runtime, so should always be used instead of going to
@@ -234,7 +243,9 @@ type Server struct {
 
 	// serfWAN is the Serf cluster maintained between DC's
 	// which SHOULD only consist of Consul servers
-	serfWAN *serf.Serf
+	serfWAN                *serf.Serf
+	memberlistTransportWAN memberlist.IngestionAwareTransport
+	gatewayLocator         *GatewayLocator
 
 	// serverLookup tracks server consuls in the local datacenter.
 	// Used to do leader forwarding and provide fast lookup by server id and address
@@ -260,6 +271,11 @@ type Server struct {
 	// tombstoneGC is used to track the pending GC invocations
 	// for the KV tombstones
 	tombstoneGC *state.TombstoneGC
+
+	// primaryMeshGatewayDiscoveredAddresses is the current fallback addresses
+	// for the mesh gateways in the primary datacenter.
+	primaryMeshGatewayDiscoveredAddresses     []string
+	primaryMeshGatewayDiscoveredAddressesLock sync.Mutex
 
 	// aclReplicationStatus (and its associated lock) provide information
 	// about the health of the ACL replication goroutine.
@@ -358,6 +374,7 @@ func NewServerLogger(config *Config, logger hclog.InterceptLogger, tokens *token
 		MaxStreams:      serverMaxStreams,
 		TLSConfigurator: tlsConfigurator,
 		ForceTLS:        config.VerifyOutgoing,
+		Datacenter:      config.Datacenter,
 	}
 
 	serverLogger := logger.NamedIntercept(logging.ConsulServer)
@@ -387,6 +404,16 @@ func NewServerLogger(config *Config, logger hclog.InterceptLogger, tokens *token
 		aclAuthMethodValidators: authmethod.NewCache(),
 	}
 
+	if s.config.ConnectMeshGatewayWANFederationEnabled {
+		s.gatewayLocator = NewGatewayLocator(
+			s.logger,
+			s,
+			s.config.Datacenter,
+			s.config.PrimaryDatacenter,
+		)
+		s.connPool.GatewayResolver = s.gatewayLocator.PickGateway
+	}
+
 	// Initialize enterprise specific server functionality
 	if err := s.initEnterprise(); err != nil {
 		s.Shutdown()
@@ -403,6 +430,22 @@ func NewServerLogger(config *Config, logger hclog.InterceptLogger, tokens *token
 		Logger:   s.logger,
 	}
 	s.configReplicator, err = NewReplicator(&configReplicatorConfig)
+	if err != nil {
+		s.Shutdown()
+		return nil, err
+	}
+
+	federationStateReplicatorConfig := ReplicatorConfig{
+		Name: "Federation State",
+		Delegate: &IndexReplicator{
+			Delegate: &FederationStateReplicator{srv: s},
+			Logger:   s.logger,
+		},
+		Rate:   s.config.FederationStateReplicationRate,
+		Burst:  s.config.FederationStateReplicationBurst,
+		Logger: logger,
+	}
+	s.federationStateReplicator, err = NewReplicator(&federationStateReplicatorConfig)
 	if err != nil {
 		s.Shutdown()
 		return nil, err
@@ -450,6 +493,10 @@ func NewServerLogger(config *Config, logger hclog.InterceptLogger, tokens *token
 		go s.trackAutoEncryptCARoots()
 	}
 
+	if s.gatewayLocator != nil {
+		go s.gatewayLocator.Run(s.shutdownCh)
+	}
+
 	// Serf and dynamic bind ports
 	//
 	// The LAN serf cluster announces the port of the WAN serf cluster
@@ -468,6 +515,11 @@ func NewServerLogger(config *Config, logger hclog.InterceptLogger, tokens *token
 			s.Shutdown()
 			return nil, fmt.Errorf("Failed to start WAN Serf: %v", err)
 		}
+
+		// This is always a *memberlist.NetTransport or something which wraps
+		// it which satisfies this interface.
+		s.memberlistTransportWAN = config.SerfWANConfig.MemberlistConfig.Transport.(memberlist.IngestionAwareTransport)
+
 		// See big comment above why we are doing this.
 		if serfBindPortWAN == 0 {
 			serfBindPortWAN = config.SerfWANConfig.MemberlistConfig.BindPort
@@ -771,6 +823,7 @@ func (s *Server) setupRPC() error {
 		return err
 	}
 	s.Listener = ln
+
 	if s.config.NotifyListen != nil {
 		s.config.NotifyListen()
 	}
@@ -1004,6 +1057,54 @@ func (s *Server) JoinWAN(addrs []string) (int, error) {
 		return 0, ErrWANFederationDisabled
 	}
 	return s.serfWAN.Join(addrs, true)
+}
+
+// PrimaryMeshGatewayAddressesReadyCh returns a channel that will be closed
+// when federation state replication ships back at least one primary mesh
+// gateway (not via fallback config).
+func (s *Server) PrimaryMeshGatewayAddressesReadyCh() <-chan struct{} {
+	if s.gatewayLocator == nil {
+		return nil
+	}
+	return s.gatewayLocator.PrimaryMeshGatewayAddressesReadyCh()
+}
+
+// PickRandomMeshGatewaySuitableForDialing is a convenience function used for writing tests.
+func (s *Server) PickRandomMeshGatewaySuitableForDialing(dc string) string {
+	if s.gatewayLocator == nil {
+		return ""
+	}
+	return s.gatewayLocator.PickGateway(dc)
+}
+
+// RefreshPrimaryGatewayFallbackAddresses is used to update the list of current
+// fallback addresses for locating mesh gateways in the primary datacenter.
+func (s *Server) RefreshPrimaryGatewayFallbackAddresses(addrs []string) (int, error) {
+	sort.Strings(addrs)
+
+	s.primaryMeshGatewayDiscoveredAddressesLock.Lock()
+	defer s.primaryMeshGatewayDiscoveredAddressesLock.Unlock()
+
+	if lib.StringSliceEqual(addrs, s.primaryMeshGatewayDiscoveredAddresses) {
+		return 0, nil
+	}
+
+	s.primaryMeshGatewayDiscoveredAddresses = addrs
+
+	s.logger.Info("updated fallback list of primary mesh gateways", "mesh_gateways", addrs)
+
+	return len(addrs), nil
+}
+
+// PrimaryGatewayFallbackAddresses returns the current set of discovered
+// fallback addresses for the mesh gateways in the primary datacenter.
+func (s *Server) PrimaryGatewayFallbackAddresses() []string {
+	s.primaryMeshGatewayDiscoveredAddressesLock.Lock()
+	defer s.primaryMeshGatewayDiscoveredAddressesLock.Unlock()
+
+	out := make([]string, len(s.primaryMeshGatewayDiscoveredAddresses))
+	copy(out, s.primaryMeshGatewayDiscoveredAddresses)
+	return out
 }
 
 // LocalMember is used to return the local node
